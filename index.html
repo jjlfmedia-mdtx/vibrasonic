@@ -912,62 +912,113 @@ async function loadLibraryFromDB() {
    LYRICS — SISTEMA MEJORADO CON FALLBACK Y CACHÉ (ESTILO APPLE MUSIC)
    =================================================================== */
 async function fetchLyrics(artist, title, album, duration) {
-    // 1. Buscar en caché primero
-    const cachedLyrics = await getLyricsFromCache(artist, title);
+    // 1. Normalizar artista y título para mejorar la búsqueda
+    const normalizedArtist = normalizeArtist(artist);
+    const normalizedTitle = normalizeTitle(title);
+    
+    // 2. Buscar en caché primero (con clave normalizada)
+    const cacheKey = `lyrics_${normalizedArtist}_${normalizedTitle}`;
+    const cachedLyrics = await getLyricsFromCache(normalizedArtist, normalizedTitle);
     if (cachedLyrics) {
         console.log(`🎵 Letras en caché para: ${artist} - ${title}`);
         return cachedLyrics;
     }
 
-    // 2. Buscar en todas las fuentes (LRCLIB, Lyrics.ovh, etc.)
-    for (const source of LYRICS_SOURCES) {
+    // 3. Buscar en todas las fuentes (ordenadas por prioridad)
+    const sources = [...LYRICS_SOURCES].sort((a, b) => (b.priority || 0) - (a.priority || 0));
+    for (const source of sources) {
         try {
             const url = source.url(artist, title, album, duration);
-            const res = await fetch(url);
+            const res = await fetch(url, { 
+                headers: { 
+                    'Accept': 'application/json',
+                    'User-Agent': 'VibraSonic/1.0 (Lyrics Fetcher)' 
+                } 
+            });
             if (res.ok) {
                 const data = await res.json();
-                const lyrics = source.parse(data);
+                const lyrics = source.parse(data, duration);
                 if (lyrics) {
-                    // Guardar en caché
-                    await saveLyricsToCache(artist, title, lyrics);
+                    // Guardar en caché con clave normalizada
+                    await saveLyricsToCache(normalizedArtist, normalizedTitle, lyrics);
                     console.log(`🎵 Letras encontradas en ${source.name} para: ${artist} - ${title}`);
                     return lyrics;
                 }
+            } else if (res.status === 404) {
+                console.warn(`⚠️ ${source.name} no encontró letras para: ${artist} - ${title}`);
+            } else {
+                console.warn(`⚠️ Error ${res.status} en ${source.name} para: ${artist} - ${title}`);
             }
         } catch (e) {
-            console.warn(`⚠️ Error en ${source.name}:`, e);
+            console.warn(`⚠️ Error en ${source.name}:`, e.message || e);
         }
     }
 
-    // 3. Búsqueda avanzada en LRCLIB (si falló la primera)
+    // 4. Búsqueda avanzada en LRCLIB con variaciones del nombre
     try {
-        const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(artist + ' ' + title)}`;
-        const res = await fetch(searchUrl);
-        if (res.ok) {
-            const arr = await res.json();
-            if (arr && arr.length > 0) {
-                const scored = arr.map(r => {
-                    let score = 0;
-                    if (r.syncedLyrics) score += 1000;
-                    if (duration && r.duration) score -= Math.abs(r.duration - duration);
-                    if (r.trackName && title && r.trackName.toLowerCase().includes(title.toLowerCase().split(' ')[0])) score += 50;
-                    if (r.artistName && artist && r.artistName.toLowerCase().includes(artist.toLowerCase().split(' ')[0])) score += 30;
-                    return { r, score };
-                }).sort((a, b) => b.score - a.score);
+        const variations = [
+            `${artist} ${title}`,
+            `${normalizedArtist} ${normalizedTitle}`,
+            `${title} ${artist}`,
+            `${normalizedTitle} ${normalizedArtist}`,
+            title, // Solo título
+            normalizedTitle, // Solo título normalizado
+        ];
+        
+        for (const query of variations) {
+            const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(query)}${duration ? `&duration=${Math.round(duration)}` : ''}`;
+            const res = await fetch(searchUrl);
+            if (res.ok) {
+                const arr = await res.json();
+                if (arr && arr.length > 0) {
+                    // Filtrar y ordenar resultados
+                    const scored = arr.map(r => {
+                        let score = 0;
+                        if (r.syncedLyrics) score += 1000;
+                        if (r.plainLyrics) score += 500;
+                        if (duration && r.duration) score -= Math.abs(r.duration - duration) * 0.1;
+                        
+                        // Comparar artista y título normalizados
+                        const rArtist = normalizeArtist(r.artistName || '');
+                        const rTitle = normalizeTitle(r.trackName || '');
+                        if (rArtist.includes(normalizedArtist) || normalizedArtist.includes(rArtist)) score += 100;
+                        if (rTitle.includes(normalizedTitle) || normalizedTitle.includes(rTitle)) score += 100;
+                        
+                        return { r, score };
+                    }).sort((a, b) => b.score - a.score);
 
-                const best = scored[0].r;
-                if (best.syncedLyrics) {
-                    await saveLyricsToCache(artist, title, best.syncedLyrics);
-                    return best.syncedLyrics;
-                }
-                if (best.plainLyrics) {
-                    await saveLyricsToCache(artist, title, best.plainLyrics);
-                    return best.plainLyrics;
+                    const best = scored[0].r;
+                    if (best.syncedLyrics) {
+                        await saveLyricsToCache(normalizedArtist, normalizedTitle, best.syncedLyrics);
+                        console.log(`🎵 Letras encontradas en búsqueda avanzada (LRCLIB) para: ${artist} - ${title}`);
+                        return best.syncedLyrics;
+                    }
+                    if (best.plainLyrics) {
+                        await saveLyricsToCache(normalizedArtist, normalizedTitle, best.plainLyrics);
+                        console.log(`🎵 Letras (no sincronizadas) encontradas en búsqueda avanzada para: ${artist} - ${title}`);
+                        return best.plainLyrics;
+                    }
                 }
             }
         }
     } catch (e) {
-        console.warn('⚠️ Error en búsqueda avanzada de LRCLIB:', e);
+        console.warn('⚠️ Error en búsqueda avanzada de LRCLIB:', e.message || e);
+    }
+
+    // 5. Si no se encontró nada, intentar con el nombre del archivo (por si el ID3 está mal)
+    const song = state.library.find(s => s.artist === artist && s.title === title);
+    if (song && song.fileName) {
+        const fileNameWithoutExt = song.fileName.replace(/\.[^.]+$/, '');
+        const fileParts = extractArtistAndTitle(fileNameWithoutExt);
+        if (fileParts.artist || fileParts.title) {
+            const result = await fetchLyrics(
+                fileParts.artist || artist,
+                fileParts.title || title,
+                album,
+                duration
+            );
+            if (result) return result;
+        }
     }
 
     return null;
@@ -976,19 +1027,57 @@ async function fetchLyrics(artist, title, album, duration) {
 async function autoSearchLyrics() {
     const need = state.library.filter(s => !s.lrcText && s.lyricsStatus === null);
     if (!need.length) return;
-    toast(`🔍 Buscando letras para ${need.length} canción${need.length!==1?'es':''}...`);
+    toast(`🔍 Buscando letras para ${need.length} canción${need.length !== 1 ? 'es' : ''}...`);
     let found = 0;
+    
     for (const song of need) {
-        song.lyricsStatus = 'searching'; renderLibrary();
-        await new Promise(r => setTimeout(r, 500));
-        const lrc = await fetchLyrics(song.artist, song.title, song.album, song.duration);
-        if (lrc) { song.lrcText = lrc; song.lyricsStatus = 'found'; found++; }
-        else { song.lyricsStatus = 'not_found'; }
+        song.lyricsStatus = 'searching';
+        renderLibrary();
+        
+        // Esperar un poco para no saturar las APIs
+        await new Promise(r => setTimeout(r, 300));
+        
+        let lrc = null;
+        
+        // 1. Intentar con artista y título originales
+        lrc = await fetchLyrics(song.artist, song.title, song.album, song.duration);
+        
+        // 2. Si no se encontró, intentar con nombres alternativos
+        if (!lrc) {
+            lrc = await tryAlternativeNames(song.artist, song.title, song.album, song.duration);
+        }
+        
+        // 3. Si aún no se encontró, intentar con el nombre del archivo
+        if (!lrc && song.fileName) {
+            const fileNameWithoutExt = song.fileName.replace(/\.[^.]+$/, '');
+            const fileParts = extractArtistAndTitle(fileNameWithoutExt);
+            if (fileParts.artist || fileParts.title) {
+                lrc = await fetchLyrics(
+                    fileParts.artist || song.artist,
+                    fileParts.title || song.title,
+                    song.album,
+                    song.duration
+                );
+            }
+        }
+        
+        if (lrc) {
+            song.lrcText = lrc;
+            song.lyricsStatus = 'found';
+            found++;
+            console.log(`✅ Letras encontradas para: ${song.artist} - ${song.title}`);
+        } else {
+            song.lyricsStatus = 'not_found';
+            console.warn(`⚠️ No se encontraron letras para: ${song.artist} - ${song.title}`);
+        }
+        
         await saveSongDB(song);
         if (state.currentSongId === song.id) renderLyrics();
         renderLibrary();
     }
-    toast(found ? `✅ ${found} letra${found!==1?'s':''} encontrada${found!==1?'s':''}` : 'No se encontraron letras');
+    
+    const message = found ? `✅ ${found} letra${found !== 1 ? 's' : ''} encontrada${found !== 1 ? 's' : ''}` : '❌ No se encontraron letras';
+    toast(message);
 }
 
 async function forceSearchAllLyrics() {
